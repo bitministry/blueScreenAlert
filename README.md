@@ -74,3 +74,26 @@ The EXE uses a mutex to ensure only one instance runs at a time.
 - This tool is intended for personal use and testing.  
 - Force-killing browsers will close all open tabs without saving unsaved data.  
 - Use with caution on production systems.
+
+
+---
+
+## What’s new
+- **Read-only config**: reads `config.ini` next to the EXE/PS1; never overwrites it.
+- **Autostart via Task Scheduler** (Defender-friendly): enabled when `added_to_startup=true` in config.
+- **Event Log**: logs config path, loaded values, task install status, and high-memory events.
+
+---
+
+## Requirements
+- Windows 10+
+- PowerShell 5+ (built-in on Win10)
+- `config.ini` in the same folder as the executable/script
+
+**Example `config.ini`:**
+```ini
+[Settings]
+limit=85
+seconds=15
+kill=chrome;msedge;firefox
+added_to_startup=true

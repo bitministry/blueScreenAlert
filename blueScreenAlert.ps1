@@ -1,79 +1,107 @@
-# VirtualMemoryGuard.ps1
-# Monitors commit charge and pagefile usage; warns and optionally kills heavy apps.
+# blueScreenAlert.ps1 — Defender-safe via Task Scheduler (read-only config)
 Add-Type -AssemblyName System.Windows.Forms
+[System.Windows.Forms.Application]::EnableVisualStyles()
 
-# ---- config (ini-like) ----
-$DefaultConfig = @"
-[Settings]
-limit=85
-seconds=15
-kill=chrome;msedge;firefox
-"@
-
-# Resolve script folder reliably (works for ps1 or compiled exe)
-if ($PSScriptRoot) {
-    $Base = $PSScriptRoot
-} else {
-    $Base = Split-Path -Parent ([System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName)
-}
-
+# --- Locate config beside script/EXE ---
+if ($PSScriptRoot) { $Base = $PSScriptRoot } else { $Base = Split-Path -Parent ([System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName) }
+$SelfPath = [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
 $ConfigPath = Join-Path $Base "config.ini"
-if (-not (Test-Path $ConfigPath)) {
-    $DefaultConfig | Set-Content -Path $ConfigPath -Encoding UTF8
+
+# --- Event source ---
+if (-not [System.Diagnostics.EventLog]::SourceExists("BlueScreenAlert")) { try { New-EventLog -LogName Application -Source "BlueScreenAlert" } catch {} }
+
+# --- Read config (READ-ONLY). If missing keys, use hard defaults (no file writes). ---
+$cfgExists = Test-Path $ConfigPath
+$ini = $null
+if ($cfgExists) { try { $ini = Get-Content -Path $ConfigPath -Raw -ErrorAction Stop } catch { $ini = $null } }
+
+function Get-IniValue([string]$iniText,[string]$key,[string]$def){
+  if (-not $iniText) { return $def }
+  $m = [regex]::Match($iniText, "^\s*${key}\s*=\s*(.+)$", 'Multiline')
+  if ($m.Success) { return $m.Groups[1].Value.Trim() } else { return $def }
 }
 
-# ---- read config ----
-$ini = Get-Content -Path $ConfigPath -Raw
-$limit   = [int]  ( ($ini -split '\r?\n') | Where-Object {$_ -match '^\s*limit\s*=\s*(\d+)'} | ForEach-Object { [int]($Matches[1]) } | Select-Object -First 1 )
-$seconds = [int]  ( ($ini -split '\r?\n') | Where-Object {$_ -match '^\s*seconds\s*=\s*(\d+)'} | ForEach-Object { [int]($Matches[1]) } | Select-Object -First 1 )
-$killStr =         ( ($ini -split '\r?\n') | Where-Object {$_ -match '^\s*kill\s*=\s*(.+)'}  | ForEach-Object { $Matches[1] }          | Select-Object -First 1 )
+$defLimit   = '85'
+$defSeconds = '15'
+$defKill    = 'chrome;msedge;firefox'
+$defAdded   = 'false'
 
-if (-not $limit)   { $limit = 85 }
-if (-not $seconds) { $seconds = 15 }
-$KillList = @()
-if ($killStr) { $KillList = $killStr -split '[;,\s]+' | Where-Object { $_ } }
+$limit   = [int](Get-IniValue $ini 'limit'   $defLimit)
+$seconds = [int](Get-IniValue $ini 'seconds' $defSeconds)
+$killStr =       Get-IniValue $ini 'kill'    $defKill
+$added   =       Get-IniValue $ini 'added_to_startup' $defAdded
+$KillList = @(); if ($killStr) { $KillList = $killStr -split '[;,\s]+' | Where-Object { $_ } }
 
-# ---- helper: read commit % ----
-function Get-CommitPercent {
-    try {
-        $c = Get-Counter '\Memory\Committed Bytes','\Memory\Commit Limit'
-        $committed = ($c.CounterSamples | Where-Object { $_.Path -like '*Committed Bytes' }).CookedValue
-        $limit     = ($c.CounterSamples | Where-Object { $_.Path -like '*Commit Limit'   }).CookedValue
-        if ($limit -gt 0) { return [math]::Round(100.0 * $committed / $limit, 1) } else { return 0 }
-    } catch { return 0 }
-}
+# --- Log config path + loaded values ---
+try {
+  if ($cfgExists) { Write-EventLog -LogName Application -Source "BlueScreenAlert" -EntryType Information -EventId 2100 -Message "Reading config from: $ConfigPath" }
+  else { Write-EventLog -LogName Application -Source "BlueScreenAlert" -EntryType Warning -EventId 2099 -Message "Config NOT found at: $ConfigPath (using in-memory defaults)" }
+  $loadedMsg = "Loaded settings -> limit=$limit, seconds=$seconds, kill=[$($KillList -join ', ')], added_to_startup=$added"
+  Write-EventLog -LogName Application -Source "BlueScreenAlert" -EntryType Information -EventId 2101 -Message $loadedMsg
+} catch {}
 
-# ---- helper: read pagefile % ----
-function Get-PagefilePercent {
-    try {
-        $p = (Get-Counter '\Paging File(_Total)\% Usage').CounterSamples[0].CookedValue
-        return [math]::Round($p,1)
-    } catch { return 0 }
-}
+# --- If config says to install, register a hidden Scheduled Task (CurrentUser) ---
+function Ensure-Task {
+  param([string]$taskName,[string]$targetPath)
 
-# ---- action: warn + kill ----
-function Take-Action([double] $commitPct, [double] $pagePct) {
-    $msg = "Memory pressure high:`nCommit: $commitPct%`nPagefile: $pagePct%"
-    [System.Windows.Forms.MessageBox]::Show($msg, "VirtualMemoryGuard", 'OK', 'Warning') | Out-Null
-    if ($KillList.Count -gt 0) {
-        foreach ($name in $KillList) {
-            Stop-Process -Name $name -Force -ErrorAction SilentlyContinue
-        }
+  try {
+    $exists = $false
+    try { $null = Get-ScheduledTask -TaskName $taskName -ErrorAction Stop; $exists = $true } catch {}
+    $action = $null
+    if ($targetPath -match '\.exe$') {
+      # Run EXE directly
+      $action = New-ScheduledTaskAction -Execute $targetPath
+    } else {
+      # Run PS1 via powershell.exe hidden
+      $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-WindowStyle Hidden -ExecutionPolicy Bypass -File `"$targetPath`""
     }
+    $trigger = New-ScheduledTaskTrigger -AtLogOn
+    $settings = New-ScheduledTaskSettingsSet -Hidden -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+    $principal = New-ScheduledTaskPrincipal -UserId $env:UserName -LogonType Interactive -RunLevel Limited
+
+    if ($exists) {
+      Set-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Settings $settings -Principal $principal | Out-Null
+      Write-EventLog -LogName Application -Source "BlueScreenAlert" -EntryType Information -EventId 2202 -Message "Scheduled task '$taskName' updated"
+    } else {
+      Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Settings $settings -Principal $principal -Description "BlueScreenAlert autostart (Defender-safe)" | Out-Null
+      Write-EventLog -LogName Application -Source "BlueScreenAlert" -EntryType Information -EventId 2201 -Message "Scheduled task '$taskName' created"
+    }
+  } catch {
+    Write-EventLog -LogName Application -Source "BlueScreenAlert" -EntryType Warning -EventId 2203 -Message "Failed to create/update task '$taskName': $($_.Exception.Message)"
+  }
 }
 
-# ---- single-instance guard ----
+if ($added -match '^(true|1|yes)$') {
+  Ensure-Task -taskName "BlueScreenAlert" -targetPath $SelfPath
+}
+
+# --- Single instance ---
 $mtx = New-Object System.Threading.Mutex($false, "Global\VirtualMemoryGuard_Mutex")
 if (-not $mtx.WaitOne(0, $false)) { return }
 
-# ---- main loop ----
+# --- Metrics ---
+function Get-CommitPercent {
+  try {
+    $c = Get-Counter '\Memory\Committed Bytes','\Memory\Commit Limit'
+    $committed = ($c.CounterSamples | Where-Object { $_.Path -like '*Committed Bytes' }).CookedValue
+    $limitb    = ($c.CounterSamples | Where-Object { $_.Path -like '*Commit Limit' }).CookedValue
+    if ($limitb -gt 0) { return [math]::Round(100.0 * $committed / $limitb, 1) } else { return 0 }
+  } catch { return 0 }
+}
+function Get-PagefilePercent { try { return [math]::Round((Get-Counter '\Paging File(_Total)\% Usage').CounterSamples[0].CookedValue,1) } catch { return 0 } }
+
+# --- Action ---
+function Take-Action([double] $commitPct, [double] $pagePct) {
+  $msg = "Memory pressure high:`nCommit: $commitPct%`nPagefile: $pagePct%"
+  [System.Windows.Forms.MessageBox]::Show($msg, "BlueScreenAlert", 'OK', 'Warning') | Out-Null
+  foreach ($name in $KillList) { Stop-Process -Name $name -Force -ErrorAction SilentlyContinue }
+  try { Write-EventLog -LogName Application -Source "BlueScreenAlert" -EntryType Warning -EventId 1001 -Message "High memory usage. Commit=$commitPct%, Pagefile=$pagePct%. Killed: $($KillList -join ', ')" } catch {}
+}
+
+# --- Main loop (keeps running) ---
 while ($true) {
-    $commitPct = Get-CommitPercent
-    $pagePct   = Get-PagefilePercent
-
-    if ($commitPct -ge $limit) {
-        Take-Action -commitPct $commitPct -pagePct $pagePct
-    }
-
-    Start-Sleep -Seconds $seconds
+  $cp = Get-CommitPercent
+  $pp = Get-PagefilePercent
+  if ($cp -ge $limit) { Take-Action -commitPct $cp -pagePct $pp }
+  Start-Sleep -Seconds $seconds
 }
