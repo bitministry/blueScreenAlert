@@ -1,59 +1,79 @@
-$exeFile = "blueScreenAlert.exe"
+# VirtualMemoryGuard.ps1
+# Monitors commit charge and pagefile usage; warns and optionally kills heavy apps.
 Add-Type -AssemblyName System.Windows.Forms
 
-# --- single-instance guard ---
-$mtx = New-Object System.Threading.Mutex($false, "Global\BlueScreenAlertMutex")
+# ---- config (ini-like) ----
+$DefaultConfig = @"
+[Settings]
+limit=85
+seconds=15
+kill=chrome;msedge;firefox
+"@
+
+# Resolve script folder reliably (works for ps1 or compiled exe)
+if ($PSScriptRoot) {
+    $Base = $PSScriptRoot
+} else {
+    $Base = Split-Path -Parent ([System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName)
+}
+
+$ConfigPath = Join-Path $Base "config.ini"
+if (-not (Test-Path $ConfigPath)) {
+    $DefaultConfig | Set-Content -Path $ConfigPath -Encoding UTF8
+}
+
+# ---- read config ----
+$ini = Get-Content -Path $ConfigPath -Raw
+$limit   = [int]  ( ($ini -split '\r?\n') | Where-Object {$_ -match '^\s*limit\s*=\s*(\d+)'} | ForEach-Object { [int]($Matches[1]) } | Select-Object -First 1 )
+$seconds = [int]  ( ($ini -split '\r?\n') | Where-Object {$_ -match '^\s*seconds\s*=\s*(\d+)'} | ForEach-Object { [int]($Matches[1]) } | Select-Object -First 1 )
+$killStr =         ( ($ini -split '\r?\n') | Where-Object {$_ -match '^\s*kill\s*=\s*(.+)'}  | ForEach-Object { $Matches[1] }          | Select-Object -First 1 )
+
+if (-not $limit)   { $limit = 85 }
+if (-not $seconds) { $seconds = 15 }
+$KillList = @()
+if ($killStr) { $KillList = $killStr -split '[;,\s]+' | Where-Object { $_ } }
+
+# ---- helper: read commit % ----
+function Get-CommitPercent {
+    try {
+        $c = Get-Counter '\Memory\Committed Bytes','\Memory\Commit Limit'
+        $committed = ($c.CounterSamples | Where-Object { $_.Path -like '*Committed Bytes' }).CookedValue
+        $limit     = ($c.CounterSamples | Where-Object { $_.Path -like '*Commit Limit'   }).CookedValue
+        if ($limit -gt 0) { return [math]::Round(100.0 * $committed / $limit, 1) } else { return 0 }
+    } catch { return 0 }
+}
+
+# ---- helper: read pagefile % ----
+function Get-PagefilePercent {
+    try {
+        $p = (Get-Counter '\Paging File(_Total)\% Usage').CounterSamples[0].CookedValue
+        return [math]::Round($p,1)
+    } catch { return 0 }
+}
+
+# ---- action: warn + kill ----
+function Take-Action([double] $commitPct, [double] $pagePct) {
+    $msg = "Memory pressure high:`nCommit: $commitPct%`nPagefile: $pagePct%"
+    [System.Windows.Forms.MessageBox]::Show($msg, "VirtualMemoryGuard", 'OK', 'Warning') | Out-Null
+    if ($KillList.Count -gt 0) {
+        foreach ($name in $KillList) {
+            Stop-Process -Name $name -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+# ---- single-instance guard ----
+$mtx = New-Object System.Threading.Mutex($false, "Global\VirtualMemoryGuard_Mutex")
 if (-not $mtx.WaitOne(0, $false)) { return }
 
-# --- paths relative to EXE location ---
-$exePath  = [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
-$basePath = Split-Path -Parent $exePath
-$configPath = Join-Path $basePath "config.ini"
-
-# --- ensure config.ini exists ---
-if (-not (Test-Path $configPath)) {
-    "[Settings]`r`nlimit=85`r`nseconds=60`r`nadded_to_startup=false" | Set-Content $configPath -Encoding ASCII
-}
-
-# --- read config.ini ---
-$config = Get-Content $configPath | Where-Object { $_ -match "=" }
-$settings = @{}
-foreach ($line in $config) {
-    $parts = $line -split "=", 2
-    if ($parts.Count -eq 2) { $settings[$parts[0].Trim()] = $parts[1].Trim() }
-}
-$limit   = [int]$settings["limit"]
-$seconds = [int]$settings["seconds"]
-
-# --- one-time add to Startup ---
-$added = $false
-if ($settings.ContainsKey("added_to_startup")) {
-    $added = ($settings["added_to_startup"].ToLower() -eq "true")
-}
-if (-not $added) {
-    $startupLnk = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\Startup\blueScreenAlert.lnk'
-    $ws = New-Object -ComObject WScript.Shell
-    $sc = $ws.CreateShortcut($startupLnk)
-    $sc.TargetPath = $exePath
-    $sc.WorkingDirectory = $basePath
-    $sc.Save()
-
-    # update config flag
-    $cfg = Get-Content $configPath -Raw
-    if ($cfg -match '(?im)^\s*added_to_startup\s*=') {
-        $cfg = [regex]::Replace($cfg,'(?im)^\s*added_to_startup\s*=\s*(true|false)\s*$','added_to_startup=true')
-    } else {
-        $cfg += "`r`nadded_to_startup=true`r`n"
-    }
-    Set-Content $configPath $cfg -Encoding ASCII
-}
-
-# --- main loop ---
+# ---- main loop ----
 while ($true) {
-    $page = Get-Counter '\Paging File(_Total)\% Usage'
-    if ($page.CounterSamples[0].CookedValue -gt $limit) {
-        [System.Windows.Forms.MessageBox]::Show("WARNING: Pagefile usage high!")
-        Stop-Process -Name chrome,msedge,firefox -Force -ErrorAction SilentlyContinue
+    $commitPct = Get-CommitPercent
+    $pagePct   = Get-PagefilePercent
+
+    if ($commitPct -ge $limit) {
+        Take-Action -commitPct $commitPct -pagePct $pagePct
     }
+
     Start-Sleep -Seconds $seconds
 }
